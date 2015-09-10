@@ -162,7 +162,12 @@ instance Monad (GenHaxl u) where
       Blocked cont -> return (Blocked (cont >>= k))
 
 instance Functor (GenHaxl u) where
-  fmap f m = pure f <*> m
+  fmap f (GenHaxl h) = GenHaxl $ \ env ref -> do
+    r <- h env ref
+    case r of
+      Done a -> return (Done (f a))
+      Throw e -> return (Throw e)
+      Blocked k -> return (Blocked (fmap f k))
 
 instance Applicative (GenHaxl u) where
   pure = return
