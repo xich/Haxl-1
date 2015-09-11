@@ -15,11 +15,12 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | The implementation of the 'Haxl' monad.
 module Haxl.Core.Monad (
     -- * The monad
-    GenHaxl (..), runHaxl,
+    GenHaxl, runHaxl,
     env,
 
     -- * Env
@@ -136,8 +137,22 @@ emptyEnv = initEnv stateEmpty
 --
 --  * It contains IO, so that we can perform real data fetching.
 --
-newtype GenHaxl u a = GenHaxl
-  { unHaxl :: Env u -> IORef (RequestStore u) -> IO (Result u a) }
+data GenHaxl u a
+  = GenHaxl (Env u -> IORef (RequestStore u) -> IO (Result u a))
+  | forall b. GenHaxl u b :>>= (b -> GenHaxl u a)
+
+-- This should be the only function that ever pattern matches on GenHaxl constructors.
+-- Anywhere else that one would pattern match on constructors should use this as a 
+-- view pattern instead.
+unHaxl :: GenHaxl u a -> Env u -> IORef (RequestStore u) -> IO (Result u a)
+unHaxl (GenHaxl f)           env ref = f env ref
+unHaxl ((m :>>= k1) :>>= k2) env ref = unHaxl (m :>>= (\ x -> k1 x :>>= k2)) env ref
+unHaxl (GenHaxl f :>>= k)    env ref = do
+  r <- f env ref
+  case r of
+    Done x -> unHaxl (k x) env ref
+    Throw e -> return (Throw e)
+    Blocked h -> return (Blocked (h >>= k))
 
 -- | The result of a computation is either 'Done' with a value, 'Throw'
 -- with an exception, or 'Blocked' on the result of a data fetch with
@@ -154,15 +169,10 @@ instance (Show a) => Show (Result u a) where
 
 instance Monad (GenHaxl u) where
   return a = GenHaxl $ \_env _ref -> return (Done a)
-  GenHaxl m >>= k = GenHaxl $ \env ref -> do
-    e <- m env ref
-    case e of
-      Done a       -> unHaxl (k a) env ref
-      Throw e      -> return (Throw e)
-      Blocked cont -> return (Blocked (cont >>= k))
+  (>>=) = (:>>=)
 
 instance Functor (GenHaxl u) where
-  fmap f (GenHaxl h) = GenHaxl $ \ env ref -> do
+  fmap f (unHaxl -> h) = GenHaxl $ \ env ref -> do
     r <- h env ref
     case r of
       Done a -> return (Done (f a))
@@ -171,7 +181,7 @@ instance Functor (GenHaxl u) where
 
 instance Applicative (GenHaxl u) where
   pure = return
-  GenHaxl f <*> GenHaxl a = GenHaxl $ \env ref -> do
+  (unHaxl -> f) <*> (unHaxl -> a) = GenHaxl $ \env ref -> do
     r <- f env ref
     case r of
       Throw e -> return (Throw e)
@@ -192,7 +202,7 @@ instance Applicative (GenHaxl u) where
 runHaxl :: Env u -> GenHaxl u a -> IO a
 #ifdef EVENTLOG
 runHaxl env h = do
-  let go !n env (GenHaxl haxl) = do
+  let go !n env (unHaxl -> haxl) = do
         traceEventIO "START computation"
         ref <- newIORef noRequests
         e <- haxl env ref
@@ -212,7 +222,7 @@ runHaxl env h = do
   traceEventIO "STOP runHaxl"
   return r
 #else
-runHaxl env (GenHaxl haxl) = do
+runHaxl env (unHaxl -> haxl) = do
   ref <- newIORef noRequests
   e <- haxl env ref
   case e of
@@ -241,7 +251,7 @@ raise = return . Throw . toException
 
 -- | Catch an exception in the Haxl monad
 catch :: Exception e => GenHaxl u a -> (e -> GenHaxl u a) -> GenHaxl u a
-catch (GenHaxl m) h = GenHaxl $ \env ref -> do
+catch (unHaxl -> m) h = GenHaxl $ \env ref -> do
    r <- m env ref
    case r of
      Done a    -> return (Done a)
@@ -275,7 +285,7 @@ unsafeLiftIO m = GenHaxl $ \_env _ref -> Done <$> m
 -- catch those exceptions in Haxl and observe the underlying execution
 -- order.  Not to be exposed to user code.
 unsafeToHaxlException :: GenHaxl u a -> GenHaxl u a
-unsafeToHaxlException (GenHaxl m) = GenHaxl $ \env ref -> do
+unsafeToHaxlException (unHaxl -> m) = GenHaxl $ \env ref -> do
   r <- m env ref `Exception.catch` \e -> return (Throw e)
   case r of
     Blocked c -> return (Blocked (unsafeToHaxlException c))
