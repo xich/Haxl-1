@@ -201,10 +201,10 @@ instance Applicative (GenHaxl u) where
 runHaxl :: Env u -> GenHaxl u a -> IO a
 #ifdef EVENTLOG
 runHaxl env h = do
-  let go !n env (GenHaxl haxl) = do
+  let go !n env c = do
         traceEventIO "START computation"
         ref <- newIORef noRequests
-        e <- haxl env ref
+        e <- toHaxl c env ref
         traceEventIO "STOP computation"
         case e of
           Done a       -> return a
@@ -215,9 +215,9 @@ runHaxl env h = do
             traceEventIO "START performFetches"
             n' <- performFetches n env bs
             traceEventIO "STOP performFetches"
-            go n' env (toHaxl cont)
+            go n' env cont
   traceEventIO "START runHaxl"
-  r <- go 0 env h
+  r <- go 0 env (Cont h)
   traceEventIO "STOP runHaxl"
   return r
 #else
