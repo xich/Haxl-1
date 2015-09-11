@@ -155,13 +155,34 @@ data Cont u a
 
 toHaxl :: Cont u a -> GenHaxl u a
 toHaxl (Cont haxl)           = haxl
-toHaxl ((m :>>= k1) :>>= k2) = toHaxl (m :>>= (\x -> k1 x >>= k2))
+toHaxl ((m :>>= k1) :>>= k2) = toHaxl (m :>>= (\x -> k1 x >>= k2)) -- fixes seql
 toHaxl (c :>>= k)            = toHaxl c >>= k
-toHaxl ((f :<$> i) :<*> (g :<$> j)) = toHaxl (((\x y -> f x (g y)) :<$> i) :<*> j)
--- toHaxl ((f :<$> i) :<*> ((g :<$> j) :<*> k)) = toHaxl ((((\ x y z -> f x (g y z)) :<$> i) :<*> j) :<*> k)
+toHaxl ((f :<$> i) :<*> (g :<$> j)) = 
+  toHaxl (((\x y -> f x (g y)) :<$> i) :<*> j)                     -- See Note [Tree]
 toHaxl (f :<*> x)            = toHaxl f <*> toHaxl x
-toHaxl (f :<$> (g :<$> x))   = toHaxl ((f . g) :<$> x)
+toHaxl (f :<$> (g :<$> x))   = toHaxl ((f . g) :<$> x)             -- fmap fusion helps par1 and tree
 toHaxl (f :<$> x)            = fmap f (toHaxl x)
+
+-- Note [Tree]
+-- This implements the following re-association:
+--
+--           <*>
+--          /   \
+--       <$>     <$>
+--      /   \   /   \
+--     f     i g     j
+--
+-- to:
+-- 
+--           <*>
+--          /   \
+--       <$>     j
+--      /   \         where h = (\x y -> f x (g y))
+--     h     i 
+--
+-- I suspect this is mostly useful because it eliminates one :<$> constructor within
+-- the Blocked returned by `tree 1`, which is replicated a lot by the tree benchmark 
+-- (tree 1 is near the leaves). So this rule might just be optimizing for a microbenchmark.
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
