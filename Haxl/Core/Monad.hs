@@ -150,11 +150,13 @@ data Result u a
 data Cont u a
   = Cont (GenHaxl u a)
   | forall b. Cont u b :>>= (b -> GenHaxl u a)
+  | forall b. (Cont u (b -> a)) :<*> (Cont u b)
 
 toHaxl :: Cont u a -> GenHaxl u a
-toHaxl (Cont haxl) = haxl
+toHaxl (Cont haxl)           = haxl
 toHaxl ((m :>>= k1) :>>= k2) = toHaxl (m :>>= (\x -> k1 x >>= k2))
-toHaxl (Cont haxl :>>= k) = haxl >>= k
+toHaxl (c :>>= k)            = toHaxl c >>= k
+toHaxl (f :<*> x)            = toHaxl f <*> toHaxl x
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
@@ -195,7 +197,7 @@ instance Applicative (GenHaxl u) where
         case ra of
           Done a'    -> return (Blocked (f' :>>= (return . ($ a'))))
           Throw e    -> return (Blocked (f' :>>= (\f -> f <$> throw e)))
-          Blocked a' -> return (Blocked (Cont (toHaxl f' <*> toHaxl a')))
+          Blocked a' -> return (Blocked (f' :<*> a'))
 
 -- | Runs a 'Haxl' computation in an 'Env'.
 runHaxl :: Env u -> GenHaxl u a -> IO a
