@@ -19,7 +19,7 @@
 -- | The implementation of the 'Haxl' monad.
 module Haxl.Core.Monad (
     -- * The monad
-    GenHaxl (..), runHaxl,
+    GenHaxl, runHaxl,
     env,
 
     -- * Env
@@ -55,7 +55,9 @@ import Control.Exception (AllocationLimitExceeded(..))
 #endif
 import Control.Monad
 import qualified Control.Exception as Exception
+#if __GLASGOW_HASKELL__ < 710
 import Control.Applicative hiding (Const)
+#endif
 import Control.DeepSeq
 import GHC.Exts (IsString(..))
 #if __GLASGOW_HASKELL__ < 706
@@ -73,6 +75,8 @@ import Control.Arrow (left)
 import Control.Exception (bracket_)
 import Debug.Trace (traceEventIO)
 #endif
+
+import Data.TASequence.FastCatQueue
 
 -- -----------------------------------------------------------------------------
 -- The environment
@@ -139,13 +143,19 @@ emptyEnv = initEnv stateEmpty
 newtype GenHaxl u a = GenHaxl
   { unHaxl :: Env u -> IORef (RequestStore u) -> IO (Result u a) }
 
+-- A Haxl continuation.
+newtype HaxlCont u a b = HaxlCont { unCont :: a -> GenHaxl u b }
+
+-- A type-aligned catenable queue of Haxl computations.
+type Haxls u a b = FastTCQueue (HaxlCont u) a b
+
 -- | The result of a computation is either 'Done' with a value, 'Throw'
 -- with an exception, or 'Blocked' on the result of a data fetch with
 -- a continuation.
-data Result u a
+data Result u a 
   = Done a
-  | Throw SomeException
-  | Blocked (GenHaxl u a)
+  | Throw SomeException  
+  | Blocked (Haxls u () a) -- input is () because just waiting for fetch data to be put into Ref
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
@@ -157,9 +167,9 @@ instance Monad (GenHaxl u) where
   GenHaxl m >>= k = GenHaxl $ \env ref -> do
     e <- m env ref
     case e of
-      Done a       -> unHaxl (k a) env ref
-      Throw e      -> return (Throw e)
-      Blocked cont -> return (Blocked (cont >>= k))
+      Done a     -> unHaxl (k a) env ref
+      Throw e    -> return (Throw e)
+      Blocked ks -> return (Blocked (ks |> HaxlCont k))
 
 instance Functor (GenHaxl u) where
   fmap f (GenHaxl h) = GenHaxl $ \ env ref -> do
@@ -167,7 +177,7 @@ instance Functor (GenHaxl u) where
     case r of
       Done a -> return (Done (f a))
       Throw e -> return (Throw e)
-      Blocked k -> return (Blocked (fmap f k))
+      Blocked ks -> return (Blocked (ks |> HaxlCont (return . f)))
 
 instance Applicative (GenHaxl u) where
   pure = return
@@ -180,13 +190,13 @@ instance Applicative (GenHaxl u) where
         case ra of
           Done a'    -> return (Done (f' a'))
           Throw e    -> return (Throw e)
-          Blocked a' -> return (Blocked (f' <$> a'))
-      Blocked f' -> do
+          Blocked as -> return (Blocked (as |> HaxlCont (return . f')))
+      Blocked fs -> do
         ra <- a env ref  -- left is blocked, explore the right
         case ra of
-          Done a'    -> return (Blocked (f' <*> return a'))
-          Throw e    -> return (Blocked (f' <*> throw e))
-          Blocked a' -> return (Blocked (f' <*> a'))
+          Done a'    -> return (Blocked (fs |> HaxlCont (return . ($ a')))) 
+          Throw e    -> return (Blocked (fs |> HaxlCont (\f -> f <$> throw e)))
+          Blocked as -> return (Blocked (haxlToHaxls ((haxlsToHaxl fs) <*> (haxlsToHaxl as)))) 
 
 -- | Runs a 'Haxl' computation in an 'Env'.
 runHaxl :: Env u -> GenHaxl u a -> IO a
@@ -212,17 +222,39 @@ runHaxl env h = do
   traceEventIO "STOP runHaxl"
   return r
 #else
-runHaxl env (GenHaxl haxl) = do
+runHaxl env = runHaxls env . haxlToHaxls
+
+runHaxls :: Env u -> Haxls u () a -> IO a
+runHaxls env hs = do
   ref <- newIORef noRequests
-  e <- haxl env ref
-  case e of
-    Done a       -> return a
-    Throw e      -> Exception.throw e
-    Blocked cont -> do
+  r <- runQueue env ref hs 
+  case r of
+    Done a     -> return a
+    Throw e    -> Exception.throw e
+    Blocked ks -> do
       bs <- readIORef ref
       writeIORef ref noRequests -- Note [RoundId]
       void (performFetches 0 env bs)
-      runHaxl env cont
+      runHaxls env ks
+
+runQueue :: forall u a. Env u -> IORef (RequestStore u) -> Haxls u () a -> IO (Result u a)
+runQueue env ref hs = go hs ()
+  where go :: Haxls u y z -> y -> IO (Result u z)
+        go hs x =
+          case tviewl hs of
+            TAEmptyL -> return (Done x)
+            HaxlCont f :< hs' -> do
+              r <- unHaxl (f x) env ref
+              case r of
+                Done x' -> go hs' x'
+                Throw e -> return (Throw e)
+                Blocked ks -> return (Blocked (ks >< hs'))
+
+haxlToHaxls :: GenHaxl u a -> Haxls u () a
+haxlToHaxls = tsingleton . HaxlCont . const
+
+haxlsToHaxl :: Haxls u () a -> GenHaxl u a
+haxlsToHaxl hs = GenHaxl $ \ env ref -> runQueue env ref hs
 #endif
 
 -- | Extracts data from the 'Env'.
@@ -247,7 +279,7 @@ catch (GenHaxl m) h = GenHaxl $ \env ref -> do
      Done a    -> return (Done a)
      Throw e | Just e' <- fromException e -> unHaxl (h e') env ref
              | otherwise -> return (Throw e)
-     Blocked k -> return (Blocked (catch k h))
+     Blocked ks -> return (Blocked (haxlToHaxls (catch (haxlsToHaxl ks) h))) 
 
 -- | Catch exceptions that satisfy a predicate
 catchIf
@@ -278,7 +310,7 @@ unsafeToHaxlException :: GenHaxl u a -> GenHaxl u a
 unsafeToHaxlException (GenHaxl m) = GenHaxl $ \env ref -> do
   r <- m env ref `Exception.catch` \e -> return (Throw e)
   case r of
-    Blocked c -> return (Blocked (unsafeToHaxlException c))
+    Blocked ks -> return (Blocked (haxlToHaxls (unsafeToHaxlException (haxlsToHaxl ks)))) 
     other -> return other
 
 -- | Like 'try', but lifts all exceptions into the 'HaxlException'
@@ -337,12 +369,12 @@ dataFetch req = GenHaxl $ \env ref -> do
     -- will be fetched in the next round.
     Uncached rvar -> do
       modifyIORef' ref $ \bs -> addRequest (BlockedFetch req rvar) bs
-      return $ Blocked (continueFetch req rvar)
+      return $ Blocked (haxlToHaxls (continueFetch req rvar))
 
     -- Seen before but not fetched yet.  We're blocked, but we don't have
     -- to add the request to the RequestStore.
     CachedNotFetched rvar -> return
-      $ Blocked (continueFetch req rvar)
+      $ Blocked (haxlToHaxls (continueFetch req rvar))
 
     -- Cached: either a result, or an exception
     Cached (Left ex) -> return (Throw ex)
@@ -363,7 +395,7 @@ uncachedRequest :: (DataSource u r, Request r a) => r a -> GenHaxl u a
 uncachedRequest req = GenHaxl $ \_env ref -> do
   rvar <- newEmptyResult
   modifyIORef' ref $ \bs -> addRequest (BlockedFetch req rvar) bs
-  return $ Blocked (continueFetch req rvar)
+  return $ Blocked (haxlToHaxls (continueFetch req rvar))
 
 continueFetch
   :: (DataSource u r, Request r a, Show a)
@@ -624,7 +656,7 @@ newtype MemoVar u a = MemoVar (IORef (MemoStatus u a))
 
 -- | The state of a memoized computation
 data MemoStatus u a
-  = MemoInProgress (RoundId u) (GenHaxl u a)
+  = MemoInProgress (RoundId u) (Haxls u () a)
       -- ^ Under evaluation in the given round, here is the latest
       -- continuation.  The continuation might be a little out of
       -- date, but that's fine, the worst that can happen is we do a
@@ -657,16 +689,16 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
   cache <- readIORef (memoRef env)
   case DataCache.lookup req cache of
     Nothing -> do
-      memovar <- newIORef (MemoInProgress ref haxl)
+      memovar <- newIORef (MemoInProgress ref (haxlToHaxls haxl))
       writeIORef (memoRef env) $! DataCache.insert req (MemoVar memovar) cache
-      run memovar haxl env ref
+      run memovar (haxlToHaxls haxl) env ref
     Just (MemoVar memovar) -> do
       status <- readIORef memovar
       case status of
         MemoDone r -> done r
-        MemoInProgress round cont
-          | round == ref -> return (Blocked (retryMemo req))
-          | otherwise    -> run memovar cont env ref
+        MemoInProgress round ks
+          | round == ref -> return (Blocked (haxlToHaxls (retryMemo req)))
+          | otherwise    -> run memovar ks env ref
           -- was blocked in a previous round; run the saved continuation to
           -- make more progress.
  where
@@ -688,14 +720,14 @@ cachedComputation req haxl = GenHaxl $ \env ref -> do
  -- looking at the MemoVar again anyway.  Furthermore, storing the
  -- exception in the MemoVar is wrong, because that will turn it into
  -- a Haxl exception (see rethrowAsyncExceptions).
-  run memovar cont env ref = do
-    e <- unHaxl cont env ref
+  run memovar ks env ref = do
+    e <- runQueue env ref ks
     case e of
       Done a -> complete memovar (Right a)
       Throw e -> complete memovar (Left e)
-      Blocked cont -> do
-        writeIORef memovar (MemoInProgress ref cont)
-        return (Blocked (retryMemo req))
+      Blocked ks -> do
+        writeIORef memovar (MemoInProgress ref ks)
+        return (Blocked (haxlToHaxls (retryMemo req)))
 
   -- We're finished: store the final result
   complete memovar r = do
