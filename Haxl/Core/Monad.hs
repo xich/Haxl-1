@@ -151,12 +151,17 @@ data Cont u a
   = Cont (GenHaxl u a)
   | forall b. Cont u b :>>= (b -> GenHaxl u a)
   | forall b. (Cont u (b -> a)) :<*> (Cont u b)
+  | forall b. (b -> a) :<$> (Cont u b)
 
 toHaxl :: Cont u a -> GenHaxl u a
 toHaxl (Cont haxl)           = haxl
 toHaxl ((m :>>= k1) :>>= k2) = toHaxl (m :>>= (\x -> k1 x >>= k2))
 toHaxl (c :>>= k)            = toHaxl c >>= k
+toHaxl ((f :<$> i) :<*> (g :<$> j)) = toHaxl (((\x y -> f x (g y)) :<$> i) :<*> j)
+-- toHaxl ((f :<$> i) :<*> ((g :<$> j) :<*> k)) = toHaxl ((((\ x y z -> f x (g y z)) :<$> i) :<*> j) :<*> k)
 toHaxl (f :<*> x)            = toHaxl f <*> toHaxl x
+toHaxl (f :<$> (g :<$> x))   = toHaxl ((f . g) :<$> x)
+toHaxl (f :<$> x)            = fmap f (toHaxl x)
 
 instance (Show a) => Show (Result u a) where
   show (Done a) = printf "Done(%s)" $ show a
@@ -178,7 +183,7 @@ instance Functor (GenHaxl u) where
     case r of
       Done a -> return (Done (f a))
       Throw e -> return (Throw e)
-      Blocked k -> return (Blocked (k :>>= (return . f)))
+      Blocked k -> return (Blocked (f :<$> k))
 
 instance Applicative (GenHaxl u) where
   pure = return
@@ -191,12 +196,12 @@ instance Applicative (GenHaxl u) where
         case ra of
           Done a'    -> return (Done (f' a'))
           Throw e    -> return (Throw e)
-          Blocked a' -> return (Blocked (a' :>>= (return . f')))
+          Blocked a' -> return (Blocked (f' :<$> a'))
       Blocked f' -> do
         ra <- a env ref  -- left is blocked, explore the right
         case ra of
-          Done a'    -> return (Blocked (f' :>>= (return . ($ a'))))
-          Throw e    -> return (Blocked (f' :>>= (\f -> f <$> throw e)))
+          Done a'    -> return (Blocked (($ a') :<$> f'))
+          Throw e    -> return (Blocked (f' :<*> Cont (throw e)))
           Blocked a' -> return (Blocked (f' :<*> a'))
 
 -- | Runs a 'Haxl' computation in an 'Env'.
